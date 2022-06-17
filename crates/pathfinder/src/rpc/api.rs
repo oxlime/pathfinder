@@ -43,6 +43,7 @@ pub struct RpcApi {
     sequencer: sequencer::Client,
     chain_id: &'static str,
     call_handle: Option<ext_py::Handle>,
+    shared_gas_price: Option<Cached>,
     sync_state: Arc<SyncState>,
 }
 
@@ -77,6 +78,7 @@ impl RpcApi {
                 Chain::Mainnet => "0x534e5f4d41494e",
             },
             call_handle: None,
+            shared_gas_price: None,
             sync_state,
         }
     }
@@ -84,6 +86,13 @@ impl RpcApi {
     pub fn with_call_handling(self, call_handle: ext_py::Handle) -> Self {
         Self {
             call_handle: Some(call_handle),
+            ..self
+        }
+    }
+
+    pub fn with_eth_gas_price(self, shared: Cached) -> Self {
+        Self {
+            shared_gas_price: Some(shared),
             ..self
         }
     }
@@ -1167,35 +1176,36 @@ impl RpcApi {
         block_hash: BlockHashOrTag,
     ) -> RpcResult<FeeEstimate> {
         use crate::cairo::ext_py::GasPriceSource;
-        use web3::types::H256;
 
-        fn get_this_value_from_somewhere() -> H256 {
-            todo!()
-        }
-
-        match (self.call_handle.as_ref(), &block_hash) {
-            (Some(h), &BlockHashOrTag::Hash(_)) => {
+        match (
+            self.call_handle.as_ref(),
+            self.shared_gas_price.as_ref(),
+            &block_hash,
+        ) {
+            (Some(h), _, &BlockHashOrTag::Hash(_)) => {
                 // discussed during estimateFee work: when using block_hash use the gasPrice from
                 // the starknet_blocks::gas_price column, otherwise (tags) get the latest eth_gasPrice.
                 h.estimate_fee(request, block_hash, GasPriceSource::PastBlock)
                     .await
                     .map_err(Error::from)
             }
-            (Some(h), &BlockHashOrTag::Tag(Tag::Latest)) => {
+            (Some(h), Some(g), &BlockHashOrTag::Tag(Tag::Latest)) => {
                 // now we want the gas_price from our hopefully pre-fetched source, it will be the
                 // same when we finally have pending support
-                h.estimate_fee(
-                    request,
-                    block_hash,
-                    GasPriceSource::Current(get_this_value_from_somewhere()),
-                )
-                .await
-                .map_err(Error::from)
+
+                let gas_price = g
+                    .get()
+                    .await
+                    .ok_or_else(|| internal_server_error("eth_gasPrice unavailable"))?;
+
+                h.estimate_fee(request, block_hash, GasPriceSource::Current(gas_price))
+                    .await
+                    .map_err(Error::from)
             }
-            (Some(_), &BlockHashOrTag::Tag(Tag::Pending)) => {
+            (Some(_), Some(_), &BlockHashOrTag::Tag(Tag::Pending)) => {
                 Err(internal_server_error("Unimplemented"))
             }
-            (None, _) => {
+            _ => {
                 // sequencer return type is incompatible with jsonrpc api return type
                 Err(internal_server_error("Unsupported configuration"))
             }
@@ -1251,4 +1261,147 @@ fn static_internal_server_error() -> jsonrpsee::core::Error {
     Error::Call(CallError::Custom(ErrorObject::from(
         jsonrpsee::types::error::ErrorCode::InternalError,
     )))
+}
+
+/// Background task updated latest `eth_gasPrice`.
+///
+/// The value is used for [`RpcApi::estimate_fee`] when user requests for [`BlockHashOrTag::Tag`].
+#[derive(Default, Clone)]
+pub struct Cached(std::sync::Arc<std::sync::Mutex<Inner>>);
+
+impl Cached {
+    /// Returns either a fast fresh value, slower a periodically polled value or fails because
+    /// polling has stopped.
+    async fn get(&self) -> Option<web3::types::H256> {
+        let mut rx = {
+            let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+
+            let stale_limit = std::time::Duration::from_secs(10);
+
+            if let Some((fetched_at, gas_price)) = g.latest.as_ref() {
+                if fetched_at.elapsed() < stale_limit {
+                    // fresh
+                    let accepted = *gas_price;
+                    g.cache_hits += 1;
+                    return Some(accepted);
+                }
+            }
+            g.next.subscribe()
+        };
+
+        // periodically polled or failure
+        rx.recv().await.ok()
+    }
+}
+
+struct Inner {
+    latest: Option<(std::time::Instant, web3::types::H256)>,
+    cache_hits: usize,
+    next: tokio::sync::broadcast::Sender<web3::types::H256>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        Inner {
+            latest: None,
+            cache_hits: 0,
+            next: tx,
+        }
+    }
+}
+
+#[tracing::instrument(name = "fetch_eth_gasPrice", skip_all)]
+pub async fn fetch_eth_gas_price_periodically(
+    client: reqwest::Client,
+    url: reqwest::Url,
+    shared: Cached,
+) {
+    #[serde_with::serde_as]
+    #[derive(serde::Deserialize, Debug)]
+    struct Response {
+        // internal of H256 required full width hex strings, so specify our own
+        #[serde_as(as = "crate::rpc::serde::H256AsHexStr")]
+        result: web3::types::H256,
+    }
+
+    let tx = shared
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .next
+        .clone();
+
+    let fetch_every = std::time::Duration::from_secs(5);
+    let request_timeout = fetch_every;
+    let minimum_sleep = std::time::Duration::from_secs(1);
+
+    let retry_base = std::time::Duration::from_secs_f64(0.5);
+    let mut retry_sleep = retry_base;
+    let max_retry = std::time::Duration::from_secs(20);
+    let retry_coefficient = 1.5;
+
+    loop {
+        let builder = client.post(url.clone());
+        let result = builder
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, crate::consts::USER_AGENT)
+            .body(r#"{"jsonrpc":"2.0","id":"1","method":"eth_gasPrice"}"#)
+            // rationale for 5s is around 10s block time on mainnet, and 15s on goerli
+            .timeout(request_timeout)
+            .send()
+            .await
+            .context("Failed to send request")
+            .and_then(|r| r.error_for_status().context("Non-ok response"));
+
+        let result = if let Ok(r) = result {
+            let full = r.bytes().await.context("Failed to receive full response");
+            full.and_then(|full| {
+                serde_json::from_slice::<Response>(&full).with_context(|| {
+                    format!(
+                        "Failed to deserialize: {:?}",
+                        String::from_utf8_lossy(&full)
+                    )
+                })
+            })
+        } else {
+            Err(result.unwrap_err())
+        };
+
+        let gas_price = match result {
+            Ok(x) => x.result,
+            Err(e) => {
+                retry_sleep = retry_sleep.mul_f64(retry_coefficient).min(max_retry);
+                tracing::debug!(error=%e, wait=?retry_sleep, "Retrying after error with eth_getPrice");
+                tokio::time::sleep(retry_sleep).await;
+                continue;
+            }
+        };
+
+        // reset retry as we succeed
+        retry_sleep = retry_base;
+        let fetched_at = std::time::Instant::now();
+
+        // first send it out to any receivers
+        // success or failure, we don't really care, sadly this cannot be used as a shutdown
+        // mechanism either because we will always hold the tx alive.
+        let _ = tx.send(gas_price);
+
+        let (delay, last_hits) = {
+            // then cache it
+            let mut g = shared.0.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = g.latest.replace((fetched_at, gas_price));
+            let last_hits = std::mem::take(&mut g.cache_hits);
+            (prev.map(|(last_at, _)| (fetched_at - last_at)), last_hits)
+        };
+
+        tracing::debug!(between=?delay, cache_hits=last_hits, "Fetched eth_gasPrice");
+
+        tokio::time::sleep(
+            fetch_every
+                .saturating_sub(fetched_at.elapsed())
+                .max(minimum_sleep),
+        )
+        .await;
+    }
 }

@@ -29,6 +29,19 @@ async fn main() -> anyhow::Result<()> {
         version = env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT"),
         "🏁 Starting node."
     );
+
+    let reqwest_client = reqwest::Client::builder()
+        .user_agent(pathfinder_lib::consts::USER_AGENT)
+        .build()
+        .context("Create HTTP client")?;
+
+    let ethereum_url = {
+        let mut url = config.ethereum.url.clone();
+        url.set_password(config.ethereum.password.as_deref())
+            .map_err(|_| anyhow::anyhow!("Configure Ethereum API password"))?;
+        url
+    };
+
     let eth_transport =
         HttpTransport::from_config(config.ethereum).context("Creating Ethereum transport")?;
 
@@ -81,8 +94,19 @@ async fn main() -> anyhow::Result<()> {
         "Creating python process for call handling. Have you setup our Python dependencies?",
     )?;
 
+    let shared = rpc::api::Cached::default();
+
+    {
+        tokio::spawn(rpc::api::fetch_eth_gas_price_periodically(
+            reqwest_client,
+            ethereum_url,
+            shared.clone(),
+        ));
+    }
+
     let api = rpc::api::RpcApi::new(storage, sequencer, ethereum_chain, sync_state)
-        .with_call_handling(call_handle);
+        .with_call_handling(call_handle)
+        .with_eth_gas_price(shared);
 
     let (rpc_handle, local_addr) = rpc::run_server(config.http_rpc_addr, api)
         .await
