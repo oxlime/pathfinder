@@ -1316,18 +1316,6 @@ struct Inner {
     taker: want::Taker,
 }
 
-#[cfg(not_now)]
-impl Default for Inner {
-    fn default() -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel(1);
-        Inner {
-            latest: None,
-            cache_hits: 0,
-            next: tx,
-        }
-    }
-}
-
 #[tracing::instrument(name = "fetch_eth_gasPrice", skip_all)]
 pub async fn fetch_eth_gas_price_periodically(
     client: reqwest::Client,
