@@ -2110,6 +2110,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vergen",
+ "want",
  "warp",
  "web3",
  "zstd",

@@ -94,13 +94,16 @@ async fn main() -> anyhow::Result<()> {
         "Creating python process for call handling. Have you setup our Python dependencies?",
     )?;
 
-    let shared = rpc::api::Cached::default();
+    let (giver, taker) = want::new();
+
+    let shared = rpc::api::Cached::new(taker);
 
     {
         tokio::spawn(rpc::api::fetch_eth_gas_price_periodically(
             reqwest_client,
             ethereum_url,
             shared.clone(),
+            giver,
         ));
     }
 

@@ -1266,15 +1266,29 @@ fn static_internal_server_error() -> jsonrpsee::core::Error {
 /// Background task updated latest `eth_gasPrice`.
 ///
 /// The value is used for [`RpcApi::estimate_fee`] when user requests for [`BlockHashOrTag::Tag`].
-#[derive(Default, Clone)]
-pub struct Cached(std::sync::Arc<std::sync::Mutex<Inner>>);
+#[derive(Clone)]
+pub struct Cached {
+    inner: std::sync::Arc<std::sync::Mutex<Inner>>,
+}
 
 impl Cached {
+    pub fn new(taker: want::Taker) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        Cached {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(Inner {
+                latest: None,
+                cache_hits: 0,
+                next: tx,
+                taker,
+            })),
+        }
+    }
+
     /// Returns either a fast fresh value, slower a periodically polled value or fails because
     /// polling has stopped.
     async fn get(&self) -> Option<web3::types::H256> {
         let mut rx = {
-            let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
             let stale_limit = std::time::Duration::from_secs(10);
 
@@ -1286,6 +1300,7 @@ impl Cached {
                     return Some(accepted);
                 }
             }
+            g.taker.want();
             g.next.subscribe()
         };
 
@@ -1298,8 +1313,10 @@ struct Inner {
     latest: Option<(std::time::Instant, web3::types::H256)>,
     cache_hits: usize,
     next: tokio::sync::broadcast::Sender<web3::types::H256>,
+    taker: want::Taker,
 }
 
+#[cfg(not_now)]
 impl Default for Inner {
     fn default() -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(1);
@@ -1316,6 +1333,7 @@ pub async fn fetch_eth_gas_price_periodically(
     client: reqwest::Client,
     url: reqwest::Url,
     shared: Cached,
+    mut interest: want::Giver,
 ) {
     #[serde_with::serde_as]
     #[derive(serde::Deserialize, Debug)]
@@ -1326,7 +1344,7 @@ pub async fn fetch_eth_gas_price_periodically(
     }
 
     let tx = shared
-        .0
+        .inner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .next
@@ -1342,6 +1360,13 @@ pub async fn fetch_eth_gas_price_periodically(
     let retry_coefficient = 1.5;
 
     loop {
+        // after each round we sleep for the amount of time to rate limit, but here we await for
+        // there to be any interest, so everytime we pass through here, there must've been
+        // interest and dissatisfaction with the cached value (if any).
+        if interest.want().await.is_err() {
+            unreachable!("we are still holding on to the taker through shared Cached");
+        }
+
         let builder = client.post(url.clone());
         let result = builder
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1382,15 +1407,15 @@ pub async fn fetch_eth_gas_price_periodically(
         retry_sleep = retry_base;
         let fetched_at = std::time::Instant::now();
 
-        // first send it out to any receivers
-        // success or failure, we don't really care, sadly this cannot be used as a shutdown
-        // mechanism either because we will always hold the tx alive.
-        let _ = tx.send(gas_price);
-
         let (delay, last_hits) = {
-            // then cache it
-            let mut g = shared.0.lock().unwrap_or_else(|e| e.into_inner());
+            // cache it
+            let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
             let prev = g.latest.replace((fetched_at, gas_price));
+            // then send it; do it in critical section because there'd otherwise be a race
+            let _ = tx.send(gas_price);
+            // mark the interest as being done
+            interest.give();
+
             let last_hits = std::mem::take(&mut g.cache_hits);
             (prev.map(|(last_at, _)| (fetched_at - last_at)), last_hits)
         };
