@@ -1290,7 +1290,7 @@ impl Cached {
         let mut rx = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-            let stale_limit = std::time::Duration::from_secs(10);
+            let stale_limit = std::time::Duration::from_secs(5);
 
             if let Some((fetched_at, gas_price)) = g.latest.as_ref() {
                 if fetched_at.elapsed() < stale_limit {
