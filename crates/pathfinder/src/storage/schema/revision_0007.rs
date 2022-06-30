@@ -1,6 +1,7 @@
-use crate::storage::state::StarknetEventsTable;
 use anyhow::Context;
 use rusqlite::{named_params, Transaction};
+
+use crate::core::{EventData, EventKey};
 
 // This is a copy of data structures and their serialization specification as of
 // revision 6. We have to keep these intact so that future changes to these types
@@ -176,6 +177,27 @@ mod transaction {
         pub code: String,
         pub error_message: String,
         pub tx_id: u64,
+    }
+}
+
+// This is copied here so that changes to the storage implementation has no effect on this
+// historical migration.
+struct StarknetEventsTable {}
+impl StarknetEventsTable {
+    fn event_data_to_bytes(data: &[EventData]) -> Vec<u8> {
+        data.iter()
+            .flat_map(|e| (*e.0.as_be_bytes()).into_iter())
+            .collect()
+    }
+
+    fn event_key_to_base64_string(key: &EventKey) -> String {
+        base64::encode(key.0.as_be_bytes())
+    }
+
+    fn event_keys_to_base64_strings(keys: &[EventKey]) -> String {
+        // TODO: we really should be using Iterator::intersperse() here once it's stabilized.
+        let keys: Vec<String> = keys.iter().map(Self::event_key_to_base64_string).collect();
+        keys.join(" ")
     }
 }
 
