@@ -31,6 +31,9 @@ RUN cargo new --lib --vcs none crates/load-test
 COPY Cargo.toml Cargo.toml
 COPY Cargo.lock Cargo.lock
 
+# Trick: fetch crate index using git CLI -- seems to use a _lot_ less memory this way.
+RUN CARGO_NET_GIT_FETCH_WITH_CLI=true cargo search --limit 0
+
 COPY crates/pathfinder/Cargo.toml crates/pathfinder/Cargo.toml
 COPY crates/pathfinder/build.rs crates/pathfinder/build.rs
 COPY crates/stark_curve/Cargo.toml crates/stark_curve/Cargo.toml
