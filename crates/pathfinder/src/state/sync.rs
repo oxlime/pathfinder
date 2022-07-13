@@ -12,7 +12,6 @@ use crate::{
     ethereum::{
         log::StateUpdateLog,
         state_update::{DeployedContract, StateUpdate},
-        transport::EthereumTransport,
     },
     rpc::types::reply::{syncing, syncing::NumberedBlock, Syncing as SyncStatus},
     sequencer::{
@@ -45,28 +44,19 @@ impl Default for State {
 }
 
 /// Implements the main sync loop, where L1 and L2 sync results are combined.
-pub async fn sync<Transport, SequencerClient, F1, F2, L1Sync, L2Sync>(
+pub async fn sync<F1, F2, L1Sync, L2Sync>(
     storage: Storage,
-    transport: Transport,
-    chain: Chain,
-    sequencer: SequencerClient,
     state: Arc<State>,
+    sequencer: impl sequencer::ClientApi + Clone + Sync + Send + 'static,
+    chain: Option<crate::core::Chain>,
     mut l1_sync: L1Sync,
-    l2_sync: L2Sync,
+    mut l2_sync: L2Sync,
 ) -> anyhow::Result<()>
 where
-    Transport: EthereumTransport + Clone,
-    SequencerClient: sequencer::ClientApi + Clone + Send + Sync + 'static,
     F1: Future<Output = anyhow::Result<()>> + Send + 'static,
     F2: Future<Output = anyhow::Result<()>> + Send + 'static,
-    L1Sync: FnMut(mpsc::Sender<l1::Event>, Transport, Chain, Option<StateUpdateLog>) -> F1,
-    L2Sync: FnOnce(
-            mpsc::Sender<l2::Event>,
-            SequencerClient,
-            Option<(StarknetBlockNumber, StarknetBlockHash)>,
-            Chain,
-        ) -> F2
-        + Copy,
+    L1Sync: FnMut(mpsc::Sender<l1::Event>, Option<StateUpdateLog>) -> F1,
+    L2Sync: FnMut(mpsc::Sender<l2::Event>, Option<(StarknetBlockNumber, StarknetBlockHash)>) -> F2,
 {
     // TODO: should this be owning a Storage, or just take in a Connection?
     let mut db_conn = storage
@@ -101,8 +91,8 @@ where
     ));
 
     // Start L1 and L2 sync processes.
-    let mut l1_handle = tokio::spawn(l1_sync(tx_l1, transport.clone(), chain, l1_head));
-    let mut l2_handle = tokio::spawn(l2_sync(tx_l2, sequencer.clone(), l2_head, chain));
+    let mut l1_handle = tokio::spawn(l1_sync(tx_l1, l1_head));
+    let mut l2_handle = tokio::spawn(l2_sync(tx_l2, l2_head));
 
     let mut existed = (0, 0);
 
@@ -183,7 +173,7 @@ where
                     let (new_tx, new_rx) = mpsc::channel(1);
                     rx_l1 = new_rx;
 
-                    l1_handle = tokio::spawn(l1_sync(new_tx, transport.clone(), chain, l1_head));
+                    l1_handle = tokio::spawn(l1_sync(new_tx, l1_head));
                     tracing::info!("L1 sync process restarted.")
                 },
             },
@@ -323,7 +313,7 @@ where
                     let (new_tx, new_rx) = mpsc::channel(1);
                     rx_l2 = new_rx;
 
-                    l2_handle = tokio::spawn(l2_sync(new_tx, sequencer.clone(), l2_head, chain));
+                    l2_handle = tokio::spawn(l2_sync(new_tx, l2_head));
                     tracing::info!("L2 sync process restarted.");
                 }
             }
@@ -337,11 +327,15 @@ async fn update_sync_status_latest(
     sequencer: impl sequencer::ClientApi,
     starting_block_hash: StarknetBlockHash,
     starting_block_num: StarknetBlockNumber,
-    chain: Chain,
+    chain: Option<Chain>,
 ) -> anyhow::Result<()> {
     use crate::core::BlockId;
 
-    let poll_interval = head_poll_interval(chain);
+    let poll_interval = if let Some(chain) = chain {
+        head_poll_interval(chain)
+    } else {
+        std::time::Duration::from_secs(60 * 5)
+    };
 
     let starting = NumberedBlock::from((starting_block_hash, starting_block_num));
 

@@ -58,7 +58,7 @@ pub struct EthereumConfig {
 #[derive(Debug, PartialEq)]
 pub struct Configuration {
     /// The Ethereum settings.
-    pub ethereum: EthereumConfig,
+    pub ethereum: Option<EthereumConfig>,
     /// The HTTP-RPC listening address and port.
     pub http_rpc_addr: SocketAddr,
     /// The node's data directory.

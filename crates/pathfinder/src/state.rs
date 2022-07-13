@@ -473,12 +473,9 @@ mod tests {
 
         sync::sync(
             storage,
-            transport,
-            chain,
-            sequencer,
             state,
-            sync::l1::sync,
-            sync::l2::sync,
+            move |tx, maybe_head| sync::l1::sync(tx, transport, chain, maybe_head),
+            move |tx, maybe_head| sync::l2::sync(tx, sequencer, maybe_head, chain),
         )
         .await
         .unwrap();

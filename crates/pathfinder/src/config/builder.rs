@@ -39,25 +39,31 @@ impl ConfigBuilder {
         use super::DEFAULT_HTTP_RPC_ADDR;
 
         // Required parameters.
-        let eth_url = self.take_required(ConfigOption::EthereumHttpUrl)?;
+        let eth_url = self.take(ConfigOption::EthereumHttpUrl);
 
-        // this used to be the url in docker run example
-        if eth_url == "https://goerli.infura.io/v3/<project-id>" {
-            return Err(std::io::Error::new(
+        let eth_url = if let Some(eth_url) = eth_url {
+            // this used to be the url in docker run example
+            if eth_url == "https://goerli.infura.io/v3/<project-id>" {
+                return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("Invalid Ethereum URL ({eth_url}): Cannot use the URL from examples!
 
 Hint: Register your own account or run your own Ethereum node and put the real URL as the configuration value.")
             ));
-        }
+            }
 
-        // Parse the Ethereum URL.
-        let eth_url = eth_url.parse::<Url>().map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid Ethereum URL ({}): {}", eth_url, err),
-            )
-        })?;
+            // Parse the Ethereum URL.
+            let eth_url = eth_url.parse::<Url>().map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid Ethereum URL ({}): {}", eth_url, err),
+                )
+            })?;
+
+            Some(eth_url)
+        } else {
+            None
+        };
 
         // Optional parameters.
         let eth_password = self.take(ConfigOption::EthereumPassword);
@@ -130,10 +136,10 @@ Hint: Register your own account or run your own Ethereum node and put the real U
         })?;
 
         Ok(Configuration {
-            ethereum: EthereumConfig {
+            ethereum: eth_url.map(move |eth_url| EthereumConfig {
                 url: eth_url,
                 password: eth_password,
-            },
+            }),
             http_rpc_addr,
             data_directory,
             sequencer_url,
@@ -142,6 +148,7 @@ Hint: Register your own account or run your own Ethereum node and put the real U
         })
     }
 
+    /*
     /// Returns the [ConfigOption] if present, else returns an [io::Error](std::io::Error).
     fn take_required(&mut self, option: ConfigOption) -> std::io::Result<String> {
         self.take(option).ok_or_else(|| {
@@ -151,6 +158,7 @@ Hint: Register your own account or run your own Ethereum node and put the real U
             )
         })
     }
+    */
 
     /// Returns the [ConfigOption], leaving it set to [None].
     pub fn take(&mut self, option: ConfigOption) -> Option<String> {

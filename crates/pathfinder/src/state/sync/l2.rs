@@ -52,7 +52,7 @@ pub async fn sync(
     tx_event: mpsc::Sender<Event>,
     sequencer: impl sequencer::ClientApi,
     mut head: Option<(StarknetBlockNumber, StarknetBlockHash)>,
-    chain: Chain,
+    chain: Option<Chain>,
 ) -> anyhow::Result<()> {
     use crate::state::sync::head_poll_interval;
 
@@ -68,7 +68,13 @@ pub async fn sync(
             match download_block(next, chain, head_hash, &sequencer).await? {
                 DownloadBlock::Block(block) => break block,
                 DownloadBlock::AtHead => {
-                    let poll_interval = head_poll_interval(chain);
+                    let poll_interval = if let Some(chain) = chain {
+                        head_poll_interval(chain)
+                    } else {
+                        // probably anything is good enough
+                        Duration::from_secs(60 * 5)
+                    };
+
                     tracing::info!(poll_interval=?poll_interval, "At head of chain");
                     tokio::time::sleep(poll_interval).await;
                 }
@@ -97,10 +103,17 @@ pub async fn sync(
         // Unwrap in both block and state update is safe as the block hash always exists (unless we query for pending).
         let block_hash = block.block_hash;
         let t_update = std::time::Instant::now();
-        let state_update = sequencer
-            .state_update(block_hash.into())
-            .await
-            .with_context(|| format!("Fetch state diff for block {:?} from sequencer", next))?;
+        let state_update = match sequencer.state_update(block_hash.into()).await {
+            Ok(update) => Ok(update),
+            Err(SequencerError::StarknetError(e))
+                if e.code == crate::sequencer::error::StarknetErrorCode::BlockNotFound =>
+            {
+                // integration does this on 734
+                sequencer.state_update(block.block_number.into()).await
+            }
+            Err(e) => Err(e),
+        }
+        .with_context(|| format!("Fetch state diff for block {:?} from sequencer", next))?;
         let state_update_block_hash = state_update.block_hash.unwrap();
         // An extra sanity check for the state update API.
         anyhow::ensure!(
@@ -257,7 +270,7 @@ enum DownloadBlock {
 
 async fn download_block(
     block_number: StarknetBlockNumber,
-    chain: Chain,
+    chain: Option<Chain>,
     prev_block_hash: Option<StarknetBlockHash>,
     sequencer: &impl sequencer::ClientApi,
 ) -> anyhow::Result<DownloadBlock> {
@@ -272,17 +285,26 @@ async fn download_block(
             let block = Box::new(block);
             // Check if block hash is correct.
             let expected_block_hash = block.block_hash;
-            let verify_hash = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let block_number = block.block_number;
-                let verify_result = verify_block_hash(&block, chain, expected_block_hash)
-                    .with_context(move || format!("Verify block {}", block_number.0))?;
-                Ok((block, verify_result))
-            });
-            let (block, verify_result) = verify_hash.await.context("Verify block hash")??;
+            let (block, verify_result) = if let Some(chain) = chain {
+                let verify_hash = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let block_number = block.block_number;
+                    let verify_result = verify_block_hash(&block, chain, expected_block_hash)
+                        .with_context(move || format!("Verify block {}", block_number.0))?;
+                    Ok((block, verify_result))
+                });
+
+                verify_hash.await.context("Verify block hash")??
+            } else {
+                // FIXME: support doing integration chain work, though I guess this should be handled
+                // properly?
+                (block, VerifyResult::NotVerifiable)
+            };
+
             if verify_result == VerifyResult::Mismatch {
                 let block_number = block.block_number;
                 tracing::warn!(?block_number, block_hash = ?expected_block_hash, "Block hash mismatch");
             }
+
             Ok(DownloadBlock::Block(block))
         }
         Ok(MaybePendingBlock::Pending(_)) => anyhow::bail!("Sequencer returned `pending` block"),
@@ -321,7 +343,7 @@ async fn download_block(
 
 async fn reorg(
     head: (StarknetBlockNumber, StarknetBlockHash),
-    chain: Chain,
+    chain: Option<Chain>,
     tx_event: &mpsc::Sender<Event>,
     sequencer: &impl sequencer::ClientApi,
 ) -> anyhow::Result<Option<(StarknetBlockNumber, StarknetBlockHash)>> {
