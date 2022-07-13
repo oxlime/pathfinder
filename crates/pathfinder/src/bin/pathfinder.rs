@@ -33,7 +33,14 @@ async fn main() -> anyhow::Result<()> {
         .ethereum
         .map(|config| HttpTransport::from_config(config).context("Creating Ethereum Transport"))
     {
-        Some(Ok(ts)) => Some(ts),
+        Some(Ok(ts)) => {
+            let chain = ts.chain().await.context(
+                "Determine Ethereum chain.
+
+Hint: Make sure the provided ethereum.url and ethereum.password are good.",
+            )?;
+            Some((ts, chain))
+        }
         Some(Err(e)) => {
             return Err(e);
         }
@@ -41,25 +48,9 @@ async fn main() -> anyhow::Result<()> {
         None => anyhow::bail!("TODO better message about forgotten parameter"),
     };
 
-    // have a special long form hint here because there should be a lot of questions coming up
-    // about this one.
-    let ethereum_chain = async {
-        if let Some(ts) = eth_transport.as_ref() {
-            ts.chain().await.map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-    .await
-    .context(
-        "Determine Ethereum chain.
-
-Hint: Make sure the provided ethereum.url and ethereum.password are good.",
-    )?;
-
-    let database_path = config.data_directory.join(match ethereum_chain {
-        Some(core::Chain::Mainnet) => "mainnet.sqlite",
-        Some(core::Chain::Goerli) => "goerli.sqlite",
+    let database_path = config.data_directory.join(match eth_transport {
+        Some((_, core::Chain::Mainnet)) => "mainnet.sqlite",
+        Some((_, core::Chain::Goerli)) => "goerli.sqlite",
         None => "integration.sqlite",
     });
     let journal_mode = match config.sqlite_wal {
@@ -68,7 +59,8 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
     };
     let storage = Storage::migrate(database_path.clone(), journal_mode).unwrap();
     info!(location=?database_path, "Database migrated.");
-    if let Some(ethereum_chain) = ethereum_chain {
+
+    if let Some((_, ethereum_chain)) = eth_transport {
         verify_database_chain(&storage, ethereum_chain).context("Verifying database")?;
     }
 
@@ -77,11 +69,11 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
             info!(?url, "Using custom Sequencer address");
             let client = sequencer::Client::with_url(url).unwrap();
             let sequencer_chain = client.chain().await.unwrap();
-            let ethereum_chain =
-                ethereum_chain.expect("should have some ethereum_chain when specifying custom url");
-            if sequencer_chain != ethereum_chain {
-                tracing::error!(sequencer=%sequencer_chain, ethereum=%ethereum_chain, "Sequencer and Ethereum network mismatch");
-                anyhow::bail!("Sequencer and Ethereum network mismatch. Sequencer is on {sequencer_chain} but Ethereum is on {ethereum_chain}");
+            if let Some((_, ethereum_chain)) = eth_transport.as_ref() {
+                if sequencer_chain != *ethereum_chain {
+                    tracing::error!(sequencer=%sequencer_chain, ethereum=%ethereum_chain, "Sequencer and Ethereum network mismatch");
+                    anyhow::bail!("Sequencer and Ethereum network mismatch. Sequencer is on {sequencer_chain} but Ethereum is on {ethereum_chain}");
+                }
             }
             client
         }
@@ -92,7 +84,9 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
             .unwrap()
         }
         None => sequencer::Client::new(
-            ethereum_chain
+            eth_transport
+                .as_ref()
+                .map(|(_, chain)| *chain)
                 .expect("should be some ethereum_chain when PATHFINDER_USE_INTEGRATION is not set"),
         )
         .unwrap(),
@@ -103,20 +97,13 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
     // TODO: maybe add a feature guarded Chain::Integration
 
     let l1_sync = {
-        let ethereum_chain = ethereum_chain.clone();
         let eth_transport = eth_transport.clone();
 
         move |tx, maybe_head| {
             let eth_transport = eth_transport.clone();
             async move {
-                if let Some(ethereum_chain) = ethereum_chain {
-                    pathfinder_lib::state::l1::sync(
-                        tx,
-                        eth_transport.expect("if eth chain then eth client"),
-                        ethereum_chain,
-                        maybe_head,
-                    )
-                    .await
+                if let Some((ts, chain)) = eth_transport {
+                    pathfinder_lib::state::l1::sync(tx, ts, chain, maybe_head).await
                 } else {
                     futures::future::pending().await
                 }
@@ -126,9 +113,10 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
 
     let l2_sync = {
         let sequencer = sequencer.clone();
-        let ethereum_chain = ethereum_chain.clone();
+        let ethereum_chain = eth_transport.as_ref().map(|(_, chain)| *chain);
 
         move |tx, maybe_head| {
+            // FIXME: needs only chain for polling delay and block verification
             pathfinder_lib::state::l2::sync(tx, sequencer.clone(), maybe_head, ethereum_chain)
         }
     };
@@ -136,13 +124,15 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
     let sync_handle = tokio::spawn(state::sync(
         storage.clone(),
         sync_state.clone(),
+        // FIXME: needed to update the highest block
         sequencer.clone(),
-        ethereum_chain,
+        // FIXME: needed for polling delay
+        eth_transport.as_ref().map(|(_, chain)| *chain),
         l1_sync,
         l2_sync,
     ));
 
-    let (api, cairo_handle) = if let Some(ethereum_chain) = ethereum_chain {
+    let (api, cairo_handle) = if let Some((eth_transport, ethereum_chain)) = eth_transport.clone() {
         // TODO: the error could be recovered, but currently it's required for startup. There should
         // not be other reason for the start to fail than python script not firing up.
         let (call_handle, cairo_handle) = cairo::ext_py::start(
@@ -156,9 +146,7 @@ Hint: Make sure the provided ethereum.url and ethereum.password are good.",
             "Creating python process for call handling. Have you setup our Python dependencies?",
         )?;
 
-        let shared = rpc::api::Cached::new(Arc::new(
-            eth_transport.expect("if eth chain then eth transport"),
-        ));
+        let shared = rpc::api::Cached::new(Arc::new(eth_transport));
 
         (
             rpc::api::RpcApi::new(storage, sequencer, Some(ethereum_chain), sync_state)
