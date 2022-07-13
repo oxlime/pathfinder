@@ -63,6 +63,10 @@ where
         .connection()
         .context("Creating database connection")?;
 
+    db_conn
+        .busy_timeout(std::time::Duration::from_secs(60))
+        .expect("should had set the busy timeout");
+
     let (tx_l1, mut rx_l1) = mpsc::channel(1);
     let (tx_l2, mut rx_l2) = mpsc::channel(1);
 
