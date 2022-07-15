@@ -67,6 +67,10 @@ where
         .busy_timeout(std::time::Duration::from_secs(60))
         .expect("should had set the busy timeout");
 
+    db_conn
+        .pragma_update(None, "wal_autocheckpoint", 1000)
+        .expect("should had set autocheckpoint");
+
     let (tx_l1, mut rx_l1) = mpsc::channel(1);
     let (tx_l2, mut rx_l2) = mpsc::channel(1);
 
