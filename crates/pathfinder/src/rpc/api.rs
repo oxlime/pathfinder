@@ -987,7 +987,8 @@ impl RpcApi {
                 .await
             }
             (Some(_), _) => {
-                // just forward it to the sequencer for now.
+                // FIXME: use latest PendingData and clone the inner arc as the diffs arg, use
+                // Latest as the block which to run on
                 self.sequencer
                     .call(request.into(), block_hash)
                     .map_ok(|x| x.result)
@@ -1215,6 +1216,8 @@ impl RpcApi {
                 .map_err(Error::from)
             }
             (Some(_), Some(_), &BlockHashOrTag::Tag(Tag::Pending)) => {
+                // FIXME: use latest PendingData and clone the inner arc as the diffs arg, use
+                // Latest as the block which to run on
                 Err(internal_server_error("Unimplemented"))
             }
             _ => {
