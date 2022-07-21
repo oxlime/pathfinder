@@ -10,6 +10,11 @@ use web3::types::{H128, H160, H256};
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, PartialOrd, Ord)]
 pub struct ContractAddress(pub StarkHash);
 
+/// A nonce that is associated with a particular deployed StarkNet contract
+/// distinguishing it from other contracts that use the same contract class.
+#[derive(Copy, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ContractNonce(pub StarkHash);
+
 /// The salt of a StarkNet contract address.
 #[derive(Copy, Clone, PartialEq, Eq, Deserialize, Serialize, PartialOrd, Ord)]
 pub struct ContractAddressSalt(pub StarkHash);
@@ -430,6 +435,7 @@ thin_starkhash_debug!(ContractAddress, StarknetTransactionHash, ClassHash,);
 
 thin_starkhash_debug_display!(
     ContractAddressSalt,
+    ContractNonce,
     ContractStateHash,
     ContractRoot,
     EntryPoint,
