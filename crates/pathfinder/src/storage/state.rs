@@ -1068,6 +1068,7 @@ impl StarknetStateUpdatesTable {
     /// Inserts a StarkNet state update accociated with a particular block into the [StarknetStateUpdatesTable].
     ///
     /// Overwrites existing data if the block hash already exists.
+    // FIXME change to an insert
     pub fn upsert(
         tx: &Transaction<'_>,
         block_hash: StarknetBlockHash,
@@ -1114,6 +1115,22 @@ impl StarknetStateUpdatesTable {
             serde_json::from_slice(&state_update).context("Deserializing state update")?;
 
         Ok(Some(state_update))
+    }
+
+    /// Deletes all rows from __head down-to reorg_tail__
+    /// i.e. it deletes all rows where `block number >= reorg_tail`.
+    pub fn reorg(tx: &Transaction<'_>, reorg_tail: StarknetBlockNumber) -> anyhow::Result<()> {
+        tx.execute(
+            r"DELETE FROM starknet_state_updates
+            WHERE ROWID IN (
+                SELECT updates.ROWID FROM starknet_state_updates updates
+                INNER JOIN starknet_blocks blocks
+                    ON (updates.block_hash = blocks.hash)
+                WHERE blocks.number >= ?
+            );",
+            params![reorg_tail.0],
+        )?;
+        Ok(())
     }
 }
 
