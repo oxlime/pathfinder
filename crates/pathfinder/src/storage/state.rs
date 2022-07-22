@@ -1097,7 +1097,7 @@ impl StarknetStateUpdatesTable {
     pub fn get(
         tx: &Transaction<'_>,
         block_hash: StarknetBlockHash,
-    ) -> anyhow::Result<Option<transaction::Transaction>> {
+    ) -> anyhow::Result<Option<StateUpdate>> {
         let mut stmt = tx
             .prepare("SELECT data FROM starknet_state_updates WHERE block_hash = ?1")
             .context("Preparing statement")?;
