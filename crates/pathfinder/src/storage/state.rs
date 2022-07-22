@@ -1068,8 +1068,7 @@ impl StarknetStateUpdatesTable {
     /// Inserts a StarkNet state update accociated with a particular block into the [StarknetStateUpdatesTable].
     ///
     /// Overwrites existing data if the block hash already exists.
-    // FIXME change to an insert
-    pub fn upsert(
+    pub fn insert(
         tx: &Transaction<'_>,
         block_hash: StarknetBlockHash,
         state_update: &StateUpdate,
@@ -1082,11 +1081,14 @@ impl StarknetStateUpdatesTable {
             .compress(&serialized)
             .context("Compress Starknet state update")?;
 
-        tx.execute(r"INSERT OR REPLACE INTO starknet_state_updates (block_hash, data) VALUES (:block_hash, :data)",
-        named_params![
-            ":block_hash": block_hash.0.as_be_bytes(),
-            ":data": &compressed,
-        ]).context("Insert state update data into state updates table")?;
+        tx.execute(
+            r"INSERT INTO starknet_state_updates (block_hash, data) VALUES (:block_hash, :data)",
+            named_params![
+                ":block_hash": block_hash.0.as_be_bytes(),
+                ":data": &compressed,
+            ],
+        )
+        .context("Insert state update data into state updates table")?;
 
         Ok(())
     }
